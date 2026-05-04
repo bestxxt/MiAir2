@@ -99,38 +99,22 @@ echo -e "${GREEN}[2/8] 获取局域网 IP...${NC}"
 
 # 获取 LAN 口 IP 的函数：按优先级依次尝试各种方式
 get_lan_ip() {
-    local ip=""
+    local ip
 
-    # 1. 优先尝试常见 LAN 桥接口名
-    for iface in br-lan br0 eth0 eth1 lan; do
-        ip=$(ip addr show "$iface" 2>/dev/null \
-             | grep -oP 'inet \K[\d.]+' \
-             | grep -v '^127\.' | head -1)
-        [ -n "$ip" ] && echo "$ip" && return
-    done
+    # 最获取默认出网使用的本机源 IP
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
 
-    # 2. 找所有以 br- 开头的桥接口
-    for iface in $(ip link show 2>/dev/null | awk -F': ' '/^[0-9]+: br-/{print $2}'); do
-        ip=$(ip addr show "$iface" 2>/dev/null \
-             | grep -oP 'inet \K[\d.]+' \
-             | grep -v '^127\.' | head -1)
-        [ -n "$ip" ] && echo "$ip" && return
-    done
+    [ -n "$ip" ] && echo "$ip" && return
 
-    # 3. 取默认路由出口接口的 IP
-    local gw_iface
-    gw_iface=$(ip route 2>/dev/null | awk '/^default/{print $5; exit}')
-    if [ -n "$gw_iface" ]; then
-        ip=$(ip addr show "$gw_iface" 2>/dev/null \
-             | grep -oP 'inet \K[\d.]+' \
-             | grep -v '^127\.' | head -1)
-        [ -n "$ip" ] && echo "$ip" && return
-    fi
+    # 没有默认路由时，兜底取第一个非 lo/docker/tailscale/veth/br-* 的 IPv4
+    ip=$(ip -o -4 addr show scope global 2>/dev/null \
+        | awk '$2 !~ /^(lo|docker0|tailscale0|veth.*|br-[a-f0-9]+)$/ {
+            split($4,a,"/");
+            print a[1];
+            exit
+        }')
 
-    # 4. 兜底：取第一个非 lo、非 docker 的内网 IP
-    ip=$(ip addr 2>/dev/null \
-         | grep -oP 'inet \K(192\.168|10\.|172\.(1[6-9]|2[0-9]|3[01]))[\d.]+' \
-         | head -1)
     [ -n "$ip" ] && echo "$ip" && return
 
     echo "127.0.0.1"
