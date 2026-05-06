@@ -132,7 +132,7 @@ if [ -z "$HOST_IP" ] || [ "$HOST_IP" = "127.0.0.1" ]; then
 else
     echo -e "${GREEN}获取到的局域网 IP 地址: ${YELLOW}$HOST_IP${NC}"
     echo "这个局域网 IP 地址是正确的吗？"
-    read -p "如果此局域网 IP 正确，请按下回车确认使用，否则请输入正确的局域网 IP 地址并按下回车。" USER_IP
+    read -p "如果此局域网 IP 正确，请按下回车确认使用，否则请输入正确的局域网 IP 地址并按下回车： " USER_IP
     if [ -n "$USER_IP" ]; then
         HOST_IP="$USER_IP"
     fi
