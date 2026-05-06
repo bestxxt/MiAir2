@@ -329,8 +329,8 @@ if [ $? -eq 0 ]; then
     fi
 
     echo -e "配置文件目录: ${GREEN}$CONFIG_DIR${NC}"
-    echo -e "Web 管理界面: ${GREEN}YourHostIP:8300${NC}"
-    echo -e "DLNA 端口: ${GREEN}8200${NC}"
+    echo -e "Web 管理界面: ${GREEN}http://$HOST_IP:8300${NC}"
+    echo -e "DLNA 服务端口: ${GREEN}8200${NC}"
     echo ""
     echo "查看日志命令:"
     echo "  docker logs -f miair"
