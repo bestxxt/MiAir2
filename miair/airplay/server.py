@@ -20,18 +20,6 @@ from typing import Callable
 import av
 from Crypto.Cipher import AES
 
-NTP_EPOCH = 2208988800  # 1900-01-01 到 1970-01-01 的秒数
-
-
-def _ntp_to_float(sec: int, frac: int) -> float:
-    return sec + frac / (2**32)
-
-
-def _float_to_ntp(ts: float) -> tuple[int, int]:
-    sec = int(ts)
-    frac = int((ts - sec) * (2**32))
-    return sec, frac
-
 from miair.airplay.audio_stream import AudioStreamServer
 from miair.airplay.mdns import AirPlayMDNS
 from miair.airplay.playfair import PlayFair
@@ -168,21 +156,6 @@ class AirPlayServer:
         self._client_name: str = ""  # 连接的客户端设备名称
         self._is_playing: bool = False # 是否正在播放
         self._loop: asyncio.AbstractEventLoop | None = None  # 事件循环引用（用于跨线程回调）
-
-        # Jitter buffer / 时钟同步 / RTCP
-        self._control_socket: socket.socket | None = None
-        self._client_addr: tuple | None = None
-        # NTP offset: sender_ntp = local_monotonic + ntp_offset
-        self._ntp_offset: float | None = None
-        self._ntp_rtp_anchor: int = 0
-        self._ntp_local_mono_at_ta: float | None = None  # TIME_ANNOUNCE 时的 local monotonic
-        # Provisional timing (首包基准，TIME_ANNOUNCE 到达前使用)
-        self._prov_rtp_base: int | None = None
-        self._prov_mono_base: float = 0.0
-        # Jitter buffer: seq -> (rtp_timestamp, payload_bytes)
-        self._jitter_buffer: dict[int, tuple[int, bytes]] = {}
-        self._jitter_lock = threading.Lock()
-        self._first_rtp_mono: float | None = None  # 首包到达的 monotonic 时间
 
     def _generate_device_id(self) -> str:
         """生成设备 MAC 地址格式的 ID
@@ -395,8 +368,6 @@ class AirPlayServer:
 
                 elif method == "SETUP":
                     session_active, rtp_socket, control_socket, timing_socket = self._handle_setup(sock, headers, cseq)
-                    self._control_socket = control_socket
-                    self._client_addr = addr
 
                 elif method == "RECORD":
                     self._handle_record(sock, cseq)
@@ -424,10 +395,8 @@ class AirPlayServer:
 
                 elif method == "FLUSH":
                     log.info("RTSP FLUSH: 清空音频缓冲区")
-                    # 清空抖动缓冲区和流队列，不停止流服务器
-                    with self._jitter_lock:
-                        self._jitter_buffer.clear()
-                    self._stream_server.start_streaming()
+                    # 仅清空队列，不停止流服务器，避免断开客户端
+                    self._stream_server.start_streaming() 
                     self._send_rtsp_response(sock, 200, cseq)
 
                 elif method == "GET_PARAMETER":
@@ -481,8 +450,6 @@ class AirPlayServer:
             # 无论正常 TEARDOWN 还是异常断开，都要重置播放状态
             self._is_playing = False
             self._client_name = ""
-            self._control_socket = None
-            self._client_addr = None
             # 关闭所有 socket（RTP、RTCP control、timing）
             for s in (rtp_socket, control_socket, timing_socket):
                 if s:
@@ -637,16 +604,6 @@ class AirPlayServer:
 
         # 初始化音频解码器
         self._init_decoder()
-
-        # 重置时钟同步和抖动缓冲区状态
-        self._ntp_offset = None
-        self._ntp_rtp_anchor = 0
-        self._ntp_local_mono_at_ta = None
-        self._prov_rtp_base = None
-        self._prov_mono_base = 0.0
-        self._first_rtp_mono = None
-        with self._jitter_lock:
-            self._jitter_buffer.clear()
 
         self._send_rtsp_response(sock, 200, cseq)
 
@@ -818,7 +775,7 @@ class AirPlayServer:
         return True, rtp_socket, control_socket, timing_socket
 
     def _rtcp_loop(self, rtcp_socket: socket.socket):
-        """RTCP 控制包接收循环 — 处理 TIME_ANNOUNCE 用于时钟同步"""
+        """RTCP 控制包接收循环"""
         log.info("RTCP 线程启动")
         try:
             while self._running:
@@ -826,28 +783,14 @@ class AirPlayServer:
                     data, addr = rtcp_socket.recvfrom(256)
                     if not data or len(data) < 4:
                         continue
+                    # RTCP 包处理 - 主要用于时间同步
                     # AirPlay 1 使用 RTCP 类型 212 (0xd4) 发送时间信息
-                    if len(data) >= 32:
+                    if len(data) >= 8:
                         ptype = data[1]
                         if ptype == 212:  # TIME_ANNOUNCE_NTP
-                            # senderRtpTimestamp @ bytes 4-7
-                            sender_rtp = int.from_bytes(data[4:8], 'big')
-                            # senderNtpTimestamp @ bytes 8-15
-                            sender_ntp_sec = int.from_bytes(data[8:12], 'big')
-                            sender_ntp_frac = int.from_bytes(data[12:16], 'big')
-                            sender_ntp = _ntp_to_float(sender_ntp_sec, sender_ntp_frac)
-                            # playAtRtpTimestamp @ bytes 16-19
-                            play_at_rtp = int.from_bytes(data[16:20], 'big')
-
-                            local_mono = time.monotonic()
-                            # sender 时钟 = local_monotonic + ntp_offset
-                            self._ntp_offset = sender_ntp - local_mono
-                            self._ntp_rtp_anchor = sender_rtp
-                            self._ntp_local_mono_at_ta = local_mono
-                            log.info(
-                                f"RTCP TIME_ANNOUNCE: ntp_offset={self._ntp_offset:.6f}, "
-                                f"senderRtp={sender_rtp}, playAtRtp={play_at_rtp}"
-                            )
+                            # 提取 sender RTP timestamp 和 playAt timestamp
+                            sender_ts = int.from_bytes(data[4:8], 'big')
+                            play_at_ts = int.from_bytes(data[16:20], 'big') if len(data) >= 20 else 0
                 except socket.timeout:
                     continue
                 except OSError:
@@ -928,7 +871,7 @@ class AirPlayServer:
             timing_socket.close()
 
     def _rtp_receive_loop(self, rtp_socket: socket.socket):
-        """RTP 音频数据接收循环 — 仅负责接收和入缓冲，不做解码"""
+        """RTP 音频数据接收循环"""
         log.info("RTP 接收线程启动")
 
         # 等待流媒体激活
@@ -942,50 +885,95 @@ class AirPlayServer:
             rtp_socket.close()
             return
 
-        # 启动抖动调度器线程（负责按 RTP 时间戳节奏解码输出）
-        scheduler = threading.Thread(target=self._jitter_scheduler, daemon=True)
-        scheduler.start()
-
         log.info("RTP: 开始接收音频数据")
         packet_count = 0
+        error_count = 0
+        last_seq = 0
 
         try:
+            jitter_buffer = {}  # seq -> pcm_data
+            next_seq = -1
+            buffer_threshold = 2  # 最小缓冲阈值以降低延迟 (约 16ms)
+            # 缓冲区最大上限，防止极端情况下内存无限增长
+            max_jitter_size = 100
+
             while self._running:
                 try:
                     data, addr = rtp_socket.recvfrom(2048)
                     if not data or len(data) < 12:
                         continue
 
-                    # RTP 头: [V/P/X/CC(1), M/PT(1), seq(2), timestamp(4), SSRC(4)]
+                    # RTP 头解析
                     seq = int.from_bytes(data[2:4], 'big')
-                    rtp_timestamp = int.from_bytes(data[4:8], 'big')
+                    payload_type = data[1] & 0x7f
                     payload = data[12:]
 
-                    now_mono = time.monotonic()
+                    # 初始对齐 next_seq
+                    if next_seq == -1:
+                        next_seq = seq
+                        log.info(f"RTP: 初始序列号 {next_seq}")
 
-                    # 记录首包到达时间（provisional timing 基准）
-                    if self._first_rtp_mono is None:
-                        self._first_rtp_mono = now_mono
-                        with self._jitter_lock:
-                            self._prov_rtp_base = rtp_timestamp
-                            self._prov_mono_base = now_mono
-                        log.info(f"RTP: 首包到达 seq={seq}, rtp_ts={rtp_timestamp}")
-
-                    # 写入抖动缓冲区
-                    with self._jitter_lock:
-                        self._jitter_buffer[seq] = (rtp_timestamp, payload)
-
-                    # 缓冲区过大时丢弃最老的包（防止 OOM）
-                    if len(self._jitter_buffer) > 100:
-                        with self._jitter_lock:
-                            keys = sorted(self._jitter_buffer.keys(),
-                                          key=lambda x: (x - seq) & 0xFFFF,
-                                          reverse=True)
-                            for k in keys[30:]:  # 保留最近 30 个包
-                                del self._jitter_buffer[k]
-                        log.warning("RTP: 抖动缓冲区溢出，已丢弃旧包")
-
+                    # 将原始 payload 放入抖动缓冲区
+                    jitter_buffer[seq] = payload
                     packet_count += 1
+
+                    # 缓冲区过大时强制清理最老的包，防止内存泄漏
+                    if len(jitter_buffer) > max_jitter_size:
+                        # 丢弃最老的包，跳转到最新的包
+                        oldest = min(jitter_buffer.keys(), key=lambda x: (x - next_seq) & 0xFFFF)
+                        while len(jitter_buffer) > buffer_threshold and oldest != next_seq:
+                            jitter_buffer.pop(oldest, None)
+                            oldest = min(jitter_buffer.keys(), key=lambda x: (x - next_seq) & 0xFFFF) if jitter_buffer else next_seq
+                        next_seq = min(jitter_buffer.keys(), key=lambda x: (x - next_seq) & 0xFFFF) if jitter_buffer else next_seq
+
+                    # 当缓冲区达到一定大小或已收到下一个期望的包时，开始输出
+                    while True:
+                        if next_seq in jitter_buffer:
+                            ordered_payload = jitter_buffer.pop(next_seq)
+                            
+                            # 解密 — IV 每包相同，但 CBC 要求每次新建 cipher
+                            if self._session_key and self._session_iv:
+                                try:
+                                    cipher = AES.new(self._session_key, AES.MODE_CBC, self._session_iv[:16])
+                                    plen = len(ordered_payload)
+                                    decrypt_len = plen & ~0xF
+                                    if decrypt_len > 0:
+                                        decrypted = cipher.decrypt(ordered_payload[:decrypt_len])
+                                        if decrypt_len < plen:
+                                            # 用 memoryview 避免尾部切片拷贝
+                                            decrypted = decrypted + bytes(memoryview(ordered_payload)[decrypt_len:])
+                                        ordered_payload = decrypted
+                                    # else: 不足 16 字节无需解密
+                                except Exception as e:
+                                    next_seq = (next_seq + 1) & 0xFFFF
+                                    continue
+
+                            # 解码音频
+                            pcm_data = self._decode_audio(ordered_payload)
+                            if pcm_data:
+                                self._stream_server.write_pcm(pcm_data)
+                            else:
+                                error_count += 1
+                                if error_count > 100:
+                                    log.warning(f"RTP: 连续解码失败 {error_count} 次")
+                                    error_count = 0
+
+                            last_seq = next_seq
+                            next_seq = (next_seq + 1) & 0xFFFF
+                            
+                        elif len(jitter_buffer) > buffer_threshold:
+                            # 缓冲区过大，说明中间丢包了，跳过丢失的包
+                            missing_seq = next_seq
+                            next_seq = min(jitter_buffer.keys(), key=lambda x: (x - missing_seq) & 0xFFFF)
+                            if self._codec_context:
+                                try:
+                                    self._codec_context.flush_buffers()
+                                except Exception as e:
+                                    pass
+                            continue
+                        else:
+                            break
+
                     if packet_count % 500 == 0:
                         log.info(f"RTP: 已接收 {packet_count} 个音频包")
 
@@ -1000,206 +988,7 @@ class AirPlayServer:
             log.error(traceback.format_exc())
         finally:
             rtp_socket.close()
-            log.info(f"RTP 接收线程结束，共接收 {packet_count} 个包")
-
-    # ================================================================
-    # 抖动调度器 — 基于 RTP timestamp + NTP 同步的节拍级输出
-    # ================================================================
-
-    def _rtp_ts_to_local_mono(self, rtp_ts: int) -> float:
-        """将 RTP timestamp 转换为本地 monotonic 时间（用于精确调度播放时刻）
-
-        优先使用 NTP 同步的精确映射，否则回退到首包基准的 provisional 映射。
-
-        推导（NTP 模式）：
-          TIME_ANNOUNCE 到达时：sender_ntp = local_mono + ntp_offset
-          sender 在 TA 时刻的 RTP 时间 = ntp_rtp_anchor
-          sender 在 rtp_ts 时刻的 NTP 时间 = sender_ntp + (rtp_ts-anchor)/sr
-          本地 monotonic = sender_ntp - ntp_offset + (rtp_ts-anchor)/sr
-                        = local_mono_at_ta + (rtp_ts-anchor)/sr
-        """
-        if (self._ntp_offset is not None
-                and self._ntp_local_mono_at_ta is not None):
-            return self._ntp_local_mono_at_ta + (rtp_ts - self._ntp_rtp_anchor) / self._sample_rate
-
-        if self._prov_rtp_base is not None:
-            return self._prov_mono_base + (rtp_ts - self._prov_rtp_base) / self._sample_rate
-
-        return time.monotonic()
-
-    def _jitter_scheduler(self):
-        """从抖动缓冲区按 RTP 时间戳节奏解码并输出音频
-
-        - 使用 NTP 同步（TIME_ANNOUNCE）精确映射 RTP timestamp → 本地播放时刻
-        - 丢包时插入静音（PLC）替代刷新 codec，避免"滋啦"声
-        - 连续丢包过多时通过 RTCP 请求重传
-        - 播放过慢（累积延迟 >300ms）时跳帧追赶到最新位置
-        """
-        log.info("抖动调度器线程启动")
-
-        # --- 调度参数 ---
-        BUFFER_TIME = 0.080          # 目标抖动缓冲 80ms
-        MAX_LATENCY = 0.300          # 最大允许累积延迟 300ms
-        GAP_SILENCE_MS = 10          # 每个丢失包插入的静音时长
-        MAX_CONSECUTIVE_GAP = 20     # 连续丢包上限，超过则请求重传
-        SCHEDULER_SLEEP = 0.005      # 空缓冲时的轮询间隔
-
-        # --- 状态 ---
-        next_seq: int = -1
-        consecutive_gaps = 0
-        decoder_errors = 0
-        silence_chunk = b'\x00' * int(self._sample_rate * self._channels * 2 * GAP_SILENCE_MS / 1000)
-        need_initial_buffer = True  # 首次需要积攒足够缓冲
-
-        while self._running and self._stream_server._active:
-            # ---- 获取下一个期望的包 ----
-            with self._jitter_lock:
-                if next_seq == -1 and self._jitter_buffer:
-                    next_seq = min(self._jitter_buffer.keys())
-                    log.info(f"调度器: 初始 seq={next_seq}")
-
-                has_next = next_seq in self._jitter_buffer
-                buf_size = len(self._jitter_buffer)
-
-            if next_seq == -1:
-                time.sleep(SCHEDULER_SLEEP)
-                continue
-
-            # ---- 首次等待抖动缓冲积攒 ----
-            if need_initial_buffer and not has_next:
-                if buf_size >= 4:
-                    need_initial_buffer = False
-                    # 重置 next_seq 到缓冲区中最早的包
-                    with self._jitter_lock:
-                        if self._jitter_buffer:
-                            next_seq = min(self._jitter_buffer.keys())
-                else:
-                    time.sleep(SCHEDULER_SLEEP)
-                    continue
-            elif need_initial_buffer:
-                need_initial_buffer = False
-
-            # ---- 丢包处理：插入静音 + 请求重传 ----
-            if not has_next:
-                if buf_size == 0:
-                    time.sleep(SCHEDULER_SLEEP)
-                    continue
-
-                consecutive_gaps += 1
-
-                # 插入静音填补空隙（PLC，不刷新解码器）
-                self._stream_server.write_pcm(silence_chunk)
-                next_seq = (next_seq + 1) & 0xFFFF
-
-                # 连续丢包过多：请求重传
-                if consecutive_gaps >= MAX_CONSECUTIVE_GAP:
-                    with self._jitter_lock:
-                        if self._jitter_buffer:
-                            newest = max(self._jitter_buffer.keys(),
-                                         key=lambda x: (x - next_seq) & 0xFFFF)
-                            gap_count = (newest - next_seq) & 0xFFFF
-                        else:
-                            gap_count = 0
-                    if gap_count > 0:
-                        log.info(f"调度器: 检测到 {gap_count} 个包缺失，请求重传")
-                        self._send_rtcp_retransmit(next_seq, gap_count)
-                    consecutive_gaps = 0
-
-                continue
-
-            # ---- 有包：取出并调度 ----
-            with self._jitter_lock:
-                rtp_ts, raw_payload = self._jitter_buffer.pop(next_seq)
-            consecutive_gaps = 0
-
-            # 解密
-            if self._session_key and self._session_iv:
-                try:
-                    cipher = AES.new(self._session_key, AES.MODE_CBC, self._session_iv[:16])
-                    plen = len(raw_payload)
-                    decrypt_len = plen & ~0xF
-                    if decrypt_len > 0:
-                        decrypted = cipher.decrypt(raw_payload[:decrypt_len])
-                        if decrypt_len < plen:
-                            decrypted = decrypted + bytes(memoryview(raw_payload)[decrypt_len:])
-                        raw_payload = decrypted
-                except Exception:
-                    next_seq = (next_seq + 1) & 0xFFFF
-                    continue
-
-            # 计算本包应播放的本地时间
-            play_time = self._rtp_ts_to_local_mono(rtp_ts) + BUFFER_TIME
-
-            # ---- 按时间戳节奏输出 ----
-            while self._running and self._stream_server._active:
-                now = time.monotonic()
-                wait = play_time - now
-
-                if wait > 0.001:
-                    time.sleep(min(wait, 0.05))
-                    continue
-
-                if wait < -MAX_LATENCY:
-                    # 累积延迟过大 → 跳帧追赶
-                    log.info(f"调度器: 延迟 {-wait*1000:.0f}ms 过大，刷新解码器追赶")
-                    if self._codec_context:
-                        try:
-                            self._codec_context.flush_buffers()
-                        except Exception:
-                            pass
-                    # 重新建立时间基准
-                    with self._jitter_lock:
-                        if self._jitter_buffer:
-                            next_seq = min(self._jitter_buffer.keys())
-                            self._prov_rtp_base = self._jitter_buffer[next_seq][0]
-                            self._prov_mono_base = time.monotonic()
-                    break
-
-                # 解码并输出
-                try:
-                    pcm_data = self._decode_audio(raw_payload)
-                    if pcm_data:
-                        self._stream_server.write_pcm(pcm_data)
-                        decoder_errors = 0
-                    else:
-                        decoder_errors += 1
-                        if decoder_errors > 100:
-                            log.warning(f"调度器: 连续解码失败 {decoder_errors} 次")
-                            decoder_errors = 0
-                except Exception:
-                    pass
-
-                break
-
-            next_seq = (next_seq + 1) & 0xFFFF
-
-        log.info("抖动调度器线程结束")
-
-    def _send_rtcp_retransmit(self, seq: int, count: int):
-        """向 AirPlay 发送端发送 RTCP 重传请求 (RAOP retransmit, type 213)
-
-        Packet format (16 bytes):
-          [0x80, 0xd5, len(2)] + [from_seq(2), count(2)] + [NTP ts(8)]
-        len = req_length/4 (单位: dwords)
-        """
-        if not self._control_socket or not self._client_addr:
-            return
-        try:
-            now_ntp = time.time() + NTP_EPOCH
-            ntp_sec, ntp_frac = _float_to_ntp(now_ntp)
-
-            pkt = bytearray(16)
-            pkt[0] = 0x80
-            pkt[1] = 0xd5  # type 213 = 0xd5
-            pkt[2:4] = (4).to_bytes(2, 'big')  # length in dwords: 16/4=4
-            pkt[4:6] = seq.to_bytes(2, 'big')
-            pkt[6:8] = count.to_bytes(2, 'big')
-            pkt[8:12] = ntp_sec.to_bytes(4, 'big')
-            pkt[12:16] = ntp_frac.to_bytes(4, 'big')
-
-            self._control_socket.sendto(bytes(pkt), self._client_addr)
-        except Exception as e:
-            log.debug(f"发送重传请求失败: {e}")
+            log.info(f"RTP 接收线程结束，共接收 {packet_count} 个包，最后 seq={last_seq}")
 
     def _decode_audio(self, data: bytes) -> bytes | None:
         """解码音频数据为 PCM"""
