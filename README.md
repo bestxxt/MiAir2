@@ -42,6 +42,13 @@ chmod +x deploy.sh manage.sh
 请确保 Docker 容器重启策略设定为 Unless Stopped。\
 部分情况下，修改配置后容器可能无法自动重启，请手动重启容器。
 
+### 使用 Docker Compose 部署 (推荐)
+1. 确保已安装 [Docker Compose](https://docs.docker.com/compose/install/)
+2. 在项目根目录下执行以下命令即可一键启动：
+```bash
+docker-compose up -d --build
+```
+
 
 ### Docker 相关命令
 ```bash

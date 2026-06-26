@@ -1,0 +1,16 @@
+
+services:
+  miair:
+    build: .
+    image: miair:latest
+    container_name: miair
+    network_mode: "host"
+    restart: unless-stopped
+    volumes:
+      - ./conf:/app/conf
+    cap_add:
+      - NET_ADMIN
+      - NET_BIND_SERVICE
+      - NET_BROADCAST
+    environment:
+      - TZ=Asia/Shanghai
