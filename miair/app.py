@@ -43,7 +43,7 @@ class MiAir:
 
     async def get_all_devices(self) -> list[dict]:
         """获取小米账号下所有设备列表"""
-        if not self.config.account and not self.config.cookie:
+        if not self.auth.is_logged_in() and not getattr(self.auth, 'need_verify', False):
             return []
         try:
             await self.auth.ensure_login()
@@ -64,8 +64,8 @@ class MiAir:
             if not self.config.auto_restart:
                 continue
 
-            # 如果没有配置账号密码，不检查
-            if not self.config.account and not self.config.cookie:
+            # 如果没有登录，不检查
+            if not self.auth.is_logged_in():
                 continue
             
             uptime = time.time() - start_time
