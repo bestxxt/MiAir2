@@ -1260,32 +1260,19 @@
         <div class="modal">
             <div class="modal-header">
                 <div class="modal-title">管理小米账号</div>
-                <div class="modal-desc">通过 Cookie 登录以发现设备</div>
+                <div class="modal-desc" id="modal-account-desc">输入小米账号和密码进行登录</div>
             </div>
 
-            <div class="form-group">
-                <label class="form-label">userId</label>
-                <input type="text" class="form-input" id="input-userId" placeholder="通常是一串数字">
-            </div>
-
-            <div class="form-group">
-                <label class="form-label">passToken</label>
-                <input type="password" class="form-input" id="input-passToken" placeholder="登录生成的访问令牌">
-            </div>
-
-            <div class="help-block">
-                打开 <a href="https://account.xiaomi.com" class="text-link" target="_blank">account.xiaomi.com</a> 并登录，按下
-                F12 进入开发人员工具 → 选择 应用程序 (Application) → Cookies，即可找到
-                <code>userId</code> 与 <code>passToken</code>。
+            <div id="qrcode-container" style="text-align: center; padding: 20px 0;">
+                <div id="qrcode-loading" style="display: none; color: var(--text-muted);">正在获取二维码...</div>
+                <img id="qrcode-img" src="" alt="登录二维码" style="display: none; margin: 0 auto; border-radius: 12px; background: white; padding: 10px; max-width: 200px; width: 100%;">
+                <div id="qrcode-tip" style="margin-top: 16px; color: var(--text-secondary); font-size: 14px; display: none;">请使用米家 APP 扫码登录</div>
             </div>
 
             <div class="tip" id="tip-account"></div>
 
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeAccountModal()">取消</button>
-                <button class="btn btn-primary" id="btn-login" onclick="loginXiaomi()">
-                    登录
-                </button>
             </div>
         </div>
     </div>
@@ -1379,15 +1366,18 @@
                     loadFormData(data);
                 }
 
-                if (data.device_list && withDeviceList) {
-                    renderDeviceList(data.device_list, data.mi_did || '');
-                } else if (!data.has_account && withDeviceList) {
+                if (data.need_verify || (!data.has_account && withDeviceList)) {
+                    const msg = data.need_verify ? '登录已失效，请重新扫码登录' : '请先配置小米账号以发现设备';
+                    const btnText = data.need_verify ? '重新扫码' : '配置账号';
                     document.getElementById('device-list').innerHTML = `
                         <div style="text-align:center; padding:40px;">
-                            <p style="color:var(--text-muted); font-size:14px; margin-bottom:16px;">请先配置小米账号以发现设备</p>
-                            <button class="btn btn-primary" onclick="openAccountModal()">配置账号</button>
+                            <p style="color:var(--text-muted); font-size:14px; margin-bottom:16px;">${msg}</p>
+                            <button class="btn btn-primary" onclick="openAccountModal()">${btnText}</button>
                         </div>
                     `;
+                    if (data.need_verify && initialLoaded) openAccountModal();
+                } else if (data.device_list && withDeviceList) {
+                    renderDeviceList(data.device_list, data.mi_did || '');
                 }
 
                 if (data.dlna_running) fetchRenderers();
@@ -1397,12 +1387,6 @@
         }
 
         function loadFormData(data) {
-            if (data.cookie) {
-                const uid = data.cookie.match(/userId=([^;]+)/);
-                const ptk = data.cookie.match(/passToken=([^;]+)/);
-                if (uid) document.getElementById('input-userId').value = uid[1];
-                if (ptk) document.getElementById('input-passToken').value = ptk[1];
-            }
             if (data.dlna_port) document.getElementById('input-dlna-port').value = data.dlna_port;
             if (data.web_port) document.getElementById('input-web-port').value = data.web_port;
             if (data.auto_resume_on_interrupt !== undefined) {
@@ -1850,31 +1834,74 @@
             }
         }
 
-        async function loginXiaomi() {
-            const btn = document.getElementById('btn-login');
+        let qrcodePollTimer = null;
+        let qrcodeTimeoutTimer = null;
+
+        async function loadLoginQrcode() {
             const tip = document.getElementById('tip-account');
-            const uid = document.getElementById('input-userId').value.trim();
-            const token = document.getElementById('input-passToken').value.trim();
-
-            if (!uid || !token) {
-                showTip(tip, '请输入完整的信息', 'error');
-                return;
-            }
-
-            showLoading(btn, true, '正在保存');
+            const img = document.getElementById('qrcode-img');
+            const loading = document.getElementById('qrcode-loading');
+            const qrTip = document.getElementById('qrcode-tip');
+            
+            img.style.display = 'none';
+            qrTip.style.display = 'none';
+            loading.style.display = 'block';
+            
             try {
-                await fetch('/api/setting', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ cookie: `userId=${uid}; passToken=${token}` }),
-                });
-                showLoading(btn, true, '正在同步');
-                setTimeout(() => location.reload(), 3000);
+                const resp = await fetch('/api/login_qrcode');
+                const result = await resp.json();
+                
+                if (result.ok && result.data && result.data.qr_url) {
+                    img.src = result.data.qr_url;
+                    img.style.display = 'block';
+                    qrTip.style.display = 'block';
+                    loading.style.display = 'none';
+                    
+                    if (qrcodePollTimer) clearTimeout(qrcodePollTimer);
+                    if (qrcodeTimeoutTimer) clearTimeout(qrcodeTimeoutTimer);
+                    
+                    pollLoginQrcode(result.data.lp_url);
+                    
+                    // 二维码通常有5分钟左右的有效期，5分钟后自动刷新一次
+                    qrcodeTimeoutTimer = setTimeout(() => {
+                        const tip = document.getElementById('tip-account');
+                        showTip(tip, '二维码已过期，已刷新', 'info');
+                        loadLoginQrcode();
+                    }, 5 * 60 * 1000);
+                } else {
+                    loading.style.display = 'none';
+                    showTip(tip, result.error || '获取二维码失败', 'error');
+                }
             } catch (e) {
-                showLoading(btn, true, '正在同步');
-                setTimeout(() => location.reload(), 4000);
+                loading.style.display = 'none';
+                showTip(tip, '网络错误，获取二维码失败', 'error');
             }
         }
+
+        async function pollLoginQrcode(lp_url) {
+            try {
+                const resp = await fetch('/api/login_qrcode_poll', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ lp_url: lp_url }),
+                });
+                const data = await resp.json();
+                if (data.ok) {
+                    if (qrcodeTimeoutTimer) clearTimeout(qrcodeTimeoutTimer);
+                    const tip = document.getElementById('tip-account');
+                    showTip(tip, '扫码登录成功！正在同步...', 'success');
+                    setTimeout(() => location.reload(), 2000);
+                } else {
+                    // 轮询超时（后台通常60秒超时），二维码尚未过期，继续轮询同一个二维码
+                    qrcodePollTimer = setTimeout(() => pollLoginQrcode(lp_url), 1000);
+                }
+            } catch (e) {
+                // 网络错误，稍后重试
+                qrcodePollTimer = setTimeout(() => pollLoginQrcode(lp_url), 3000);
+            }
+        }
+
+
 
         async function saveExperimental() {
             const btn = document.getElementById('btn-save-experimental');
@@ -1985,8 +2012,19 @@
         }
 
         // UI Utils
-        function openAccountModal() { document.getElementById('modal-account').classList.add('active'); }
-        function closeAccountModal() { document.getElementById('modal-account').classList.remove('active'); }
+        function openAccountModal() { 
+            const modal = document.getElementById('modal-account');
+            if (modal.classList.contains('active')) return;
+            modal.classList.add('active'); 
+            loadLoginQrcode();
+        }
+        function closeAccountModal() { 
+            document.getElementById('modal-account').classList.remove('active'); 
+            if (qrcodePollTimer) {
+                clearTimeout(qrcodePollTimer);
+                qrcodePollTimer = null;
+            }
+        }
 
         function showTip(el, msg, type, duration = 5000) {
             el.textContent = msg;

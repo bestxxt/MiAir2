@@ -36,12 +36,16 @@ class AuthManager:
         self.mina_service: MiNAService | None = None
         self.miio_service: MiIOService | None = None
         self._logged_in = False
+        
+        # 验证码流程相关状态
+        self.need_verify = False
+        self.verify_url = ""
+        self.cloud_auth = None
 
     async def login(self):
         """登录小米账号并初始化服务"""
         os.makedirs(self.config.conf_path, exist_ok=True)
 
-        # 创建 aiohttp session（必须设置超时，否则 miservice HTTP 调用可能无限挂起导致卡死）
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15, connect=5, sock_read=10)
@@ -49,98 +53,190 @@ class AuthManager:
 
         token_store = self.config.mi_token_home
 
-        # 如果有 cookie，使用 cookie 中的信息创建 MiAccount
-        token_data = {}
-        if self.config.cookie:
-            token_data = parse_cookie_string(self.config.cookie)
-        
-        # 创建 MiAccount，如果使用 cookie 登录，传入空的账号密码
-        if token_data.get("userId") and token_data.get("passToken"):
-            # 使用 cookie 登录，传入空的账号密码，避免触发密码登录流程
-            self.account = MiAccount(
-                self.session,
-                "",  # 空账号
-                "",  # 空密码
-                token_store=token_store,
-            )
-            # 设置 token，包含所有必要字段
-            self.account.token = {
-                "userId": token_data["userId"],
-                "passToken": token_data["passToken"],
-                "deviceId": "miair_device",
-                "ssecurity": "",
-                "serviceToken": "",
-            }
-            log.info("使用 cookie 登录")
-        else:
-            # 使用账号密码登录
+        # 初始化基础 MiAccount（供后续服务使用）
+        if self.account is None:
             self.account = MiAccount(
                 self.session,
                 self.config.account,
                 self.config.password,
                 token_store=token_store,
             )
-            # 确保 token 不为 None，避免后续操作出错
             if not hasattr(self.account, 'token') or self.account.token is None:
                 self.account.token = {"deviceId": "miair_device"}
 
-        # 显式调用 login
-        # 如果使用 cookie 登录，跳过 login 调用，直接标记为已登录
-        if token_data.get("userId") and token_data.get("passToken"):
-            self._logged_in = True
-            log.info("使用 cookie 登录成功")
-        else:
-            try:
-                await self.account.login("micoapi")
+        # 如果有 cookie，直接当做已登录（兼容历史配置，但仍可能有签名缺陷）
+        if self.config.cookie:
+            token_data = parse_cookie_string(self.config.cookie)
+            if token_data.get("userId") and token_data.get("passToken"):
+                self.account.token.update({
+                    "userId": token_data["userId"],
+                    "passToken": token_data["passToken"],
+                    "ssecurity": "",
+                    "serviceToken": "",
+                })
                 self._logged_in = True
-                log.info("小米账号登录成功")
-            except Exception as e:
-                self._logged_in = False
-                # 确保 token 不为 None，避免后续操作出错
-                if not hasattr(self.account, 'token') or self.account.token is None:
-                    self.account.token = {"deviceId": "miair_device"}
-                err_msg = str(e)
-                err_code = self._extract_error_code(err_msg)
-                if err_code == "87001" or "captcha" in err_msg.lower():
-                    log.error(
-                        "登录需要验证码! 请在浏览器访问 https://account.xiaomi.com 完成验证后重试，"
-                        "或使用 cookie 方式登录"
-                    )
-                elif err_code == "70016":
-                    log.error(
-                        "登录验证失败! 可能原因：密码错误、需要关闭二次验证、"
-                        "或需要在 https://www.mi.com 完成人机验证。"
-                        "建议使用 cookie 方式登录。"
-                    )
-                elif "userId" in err_msg:
-                    log.error(
-                        "登录失败(缺少userId)! 小米账号可能需要额外验证。"
-                        "请尝试以下方法：\n"
-                        "  1. 在浏览器登录 https://account.xiaomi.com 完成验证\n"
-                        "  2. 使用 cookie 方式登录（在设置中填入 cookie）\n"
-                        "  3. 确保关闭了代理/VPN"
-                    )
-                else:
-                    log.error(f"登录失败: {e}")
-                
-                # 如果开启了自动重启，则在严重错误时尝试重启程序
-                if self.config.auto_restart:
-                    log.warning("检测到登录失败，正在尝试自动重启程序以恢复服务...")
-                    from miair.web.api import _restart_process
-                    import asyncio
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.call_later(5, _restart_process)
-                    except RuntimeError:
-                        # 如果没有正在运行的 loop，则直接重启
-                        _restart_process()
+                log.info("使用 cookie 登录（跳过底层验证）")
+                self._init_services()
+                return
 
-        # 无论是否登录成功，都设置 service (方便后续重试)
+        # 使用云端原生登录逻辑
+        from miair.cloud import MiCloudAuth, NeedVerifyException, MiCloudException
+        
+        if self.cloud_auth is None:
+            self.cloud_auth = MiCloudAuth(self.config.account, self.config.password, session=self.session)
+            
+            # 如果 miservice 的 token 库中保存了上次扫码的 passToken，我们将其注入到 cloud_auth 中
+            if self.account and hasattr(self.account, 'token') and self.account.token:
+                if 'passToken' in self.account.token:
+                    self.cloud_auth.pass_token = self.account.token['passToken']
+                    self.cloud_auth.cookies['passToken'] = self.account.token['passToken']
+                if 'userId' in self.account.token:
+                    self.cloud_auth.user_id = str(self.account.token['userId'])
+                    self.cloud_auth.cookies['userId'] = str(self.account.token['userId'])
+            
+        try:
+            # 尝试登录小爱服务
+            await self.cloud_auth.login("micoapi")
+            self._populate_account_token("micoapi")
+            
+            # 为了米家设备，尝试获取 xiaomiio 的 token
+            try:
+                await self.cloud_auth.login("xiaomiio")
+                self._populate_account_token("xiaomiio")
+            except Exception as e:
+                log.warning(f"获取米家(xiaomiio) token 失败: {e}，可能影响设备控制")
+                
+            self._logged_in = True
+            self.need_verify = False
+            self.verify_url = ""
+            log.info("小米账号登录成功")
+            
+            # 保存合并后的 token 到 miservice 的缓存
+            if self.account.token_store:
+                self.account.token_store.save_token(self.account.token)
+                
+        except NeedVerifyException as e:
+            self._logged_in = False
+            self.need_verify = True
+            self.verify_url = e.verify_url
+            log.warning(f"登录需要验证码! 验证链接: {self.verify_url}")
+            
+        except Exception as e:
+            self._logged_in = False
+            log.error(f"登录失败: {e}")
+            if self.config.auto_restart:
+                log.warning("检测到登录失败，正在尝试自动重启程序以恢复服务...")
+                from miair.web.api import _restart_process
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.call_later(5, _restart_process)
+                except RuntimeError:
+                    _restart_process()
+
+        self._init_services()
+
+    async def submit_verify_ticket(self, ticket: str) -> bool:
+        """提交二次验证码(ticket)以完成登录"""
+        if not self.cloud_auth or not self.need_verify:
+            log.warning("当前不需要验证码，或者未初始化登录")
+            return False
+            
+        from miair.cloud import MiCloudException
+        try:
+            log.info(f"正在提交验证码进行验证...")
+            # 利用之前保存的上下文恢复登录
+            await self.cloud_auth.login("micoapi", login_data={"verify_ticket": ticket})
+            self._populate_account_token("micoapi")
+            
+            # 尝试获取 xiaomiio 的 token
+            try:
+                await self.cloud_auth.login("xiaomiio")
+                self._populate_account_token("xiaomiio")
+            except Exception as e:
+                log.warning(f"获取米家(xiaomiio) token 失败: {e}")
+                
+            self._logged_in = True
+            self.need_verify = False
+            self.verify_url = ""
+            log.info("验证码校验通过，小米账号登录成功")
+            
+            if self.account and self.account.token_store:
+                self.account.token_store.save_token(self.account.token)
+                
+            self._init_services()
+            return True
+            
+        except Exception as e:
+            log.error(f"验证码校验失败或后续登录失败: {e}")
+            return False
+
+    async def poll_qrcode_login(self, lp_url: str) -> bool:
+        """轮询二维码扫码状态并在成功后初始化服务"""
+        if not self.cloud_auth:
+            return False
+            
+        try:
+            log.info(f"正在轮询扫码登录状态...")
+            success = await self.cloud_auth.poll_qrcode_login(lp_url)
+            if success:
+                # 扫码成功后，目前 cloud_auth 内部拥有了全局 passToken
+                # 我们只需要分别显式调用 login() 获取对应的 serviceToken 即可
+                
+                # 获取 micoapi Token
+                await self.cloud_auth.login("micoapi")
+                self._populate_account_token("micoapi")
+                
+                # 获取 xiaomiio Token
+                await self.cloud_auth.login("xiaomiio")
+                self._populate_account_token("xiaomiio")
+                
+                self._logged_in = True
+                self.need_verify = False
+                self.verify_url = ""
+                log.info("扫码登录完成，获取服务 Token 成功")
+                
+                if self.account.token_store:
+                    self.account.token_store.save_token(self.account.token)
+                    
+                self._init_services()
+                return True
+            else:
+                log.warning("扫码登录未成功或已超时")
+                return False
+        except Exception as e:
+            log.error(f"扫码登录过程中发生错误: {e}")
+            return False
+
+    def _populate_account_token(self, sid: str):
+        """将 cloud_auth 获取到的 token 填充到 miservice 的 account 中"""
+        if not self.account:
+            return
+        t = self.account.token
+        t["userId"] = self.cloud_auth.user_id
+        t["passToken"] = self.cloud_auth.pass_token
+        t[sid] = (self.cloud_auth.ssecurity, self.cloud_auth.service_token)
+
+    def _init_services(self):
+        """初始化底层服务"""
         self.mina_service = MiNAService(self.account)
         self.miio_service = MiIOService(self.account)
 
+    def clear_login_state(self):
+        """清除当前登录状态，强制重新登录"""
+        self._logged_in = False
+        self.need_verify = False
+        self.verify_url = ""
+        self.cloud_auth = None
+        self.account = None
+        self.mina_service = None
+        self.miio_service = None
+
     async def ensure_login(self):
         """确保已登录，未登录则尝试登录"""
+        if self.need_verify:
+            return
+            
         if self.mina_service is None or not self._logged_in:
             await self.login()
 
@@ -154,7 +250,10 @@ class AuthManager:
         """获取账号下所有设备列表"""
         await self.ensure_login()
         if not self._logged_in:
-            log.warning("未成功登录，无法获取设备列表")
+            if getattr(self, "need_verify", False):
+                log.debug("等待输入验证码，无法获取设备列表")
+            else:
+                log.debug("未成功登录，无法获取设备列表")
             return []
         try:
             devices = await self.mina_service.device_list()

@@ -95,7 +95,7 @@ def create_web_app(config: Config, app_instance) -> web.Application:
             "proxy_enabled": config.proxy_enabled,
             "auto_play_on_set_uri": config.auto_play_on_set_uri,
             "mi_did": config.mi_did,
-            "has_account": bool(config.account or config.cookie),
+            "has_account": app_instance.auth.is_logged_in() if getattr(app_instance, "auth", None) else False,
             "cookie": config.cookie,
             "dlna_running": app_instance.dlna_running,
             "renderers_count": len(app_instance.renderers),
@@ -105,6 +105,9 @@ def create_web_app(config: Config, app_instance) -> web.Application:
             "default_volume": config.default_volume,
             "follow_device_volume": config.follow_device_volume,
             "auto_restart": config.auto_restart,
+            # 二次验证相关
+            "need_verify": getattr(app_instance.auth, "need_verify", False),
+            "verify_url": getattr(app_instance.auth, "verify_url", ""),
         }
 
         # 返回已配置的 speakers 信息
@@ -135,12 +138,19 @@ def create_web_app(config: Config, app_instance) -> web.Application:
         data = await request.json()
 
         # 更新账号信息
-        if "account" in data:
+        account_changed = False
+        if "account" in data and data["account"] != config.account:
             config.account = data["account"]
-        if "password" in data:
+            account_changed = True
+        if "password" in data and data["password"] != config.password:
             config.password = data["password"]
-        if "cookie" in data:
+            account_changed = True
+        if "cookie" in data and data["cookie"] != config.cookie:
             config.cookie = data["cookie"]
+            account_changed = True
+
+        if account_changed:
+            app_instance.auth.clear_login_state()
 
         # 更新设备选择
         if "mi_did" in data:
@@ -354,6 +364,41 @@ def create_web_app(config: Config, app_instance) -> web.Application:
         asyncio.get_running_loop().call_soon(_restart_process)
         return resp
 
+    async def handle_verify_ticket(request):
+        """处理用户提交的二次验证码"""
+        data = await request.json()
+        ticket = data.get("ticket")
+        if not ticket:
+            return web.json_response({"ok": False, "error": "验证码不能为空"})
+            
+        success = await app_instance.auth.submit_verify_ticket(ticket)
+        if success:
+            return web.json_response({"ok": True})
+        else:
+            return web.json_response({"ok": False, "error": "验证码错误或验证失败，请重试或检查日志"})
+
+    async def handle_get_login_qrcode(request):
+        """获取登录二维码"""
+        if not app_instance.auth.cloud_auth:
+            return web.json_response({"ok": False, "error": "小米云服务未初始化"})
+            
+        data = await app_instance.auth.cloud_auth.get_login_qrcode()
+        if data:
+            return web.json_response({"ok": True, "data": data})
+        return web.json_response({"ok": False, "error": "获取二维码失败"})
+
+    async def handle_poll_qrcode_login(request):
+        """轮询二维码扫码结果"""
+        data = await request.json()
+        lp_url = data.get("lp_url")
+        if not lp_url:
+            return web.json_response({"ok": False, "error": "缺少 lp_url 参数"})
+            
+        success = await app_instance.auth.poll_qrcode_login(lp_url)
+        if success:
+            return web.json_response({"ok": True})
+        return web.json_response({"ok": False, "error": "扫码登录未成功或超时"})
+
     # 注册路由
     web_app.router.add_get("/", handle_index)
     web_app.router.add_get("/api/setting", handle_get_setting)
@@ -363,6 +408,9 @@ def create_web_app(config: Config, app_instance) -> web.Application:
     web_app.router.add_post("/api/speakers/{did}/rename", handle_rename_speaker)
     web_app.router.add_get("/api/status", handle_status)
     web_app.router.add_post("/api/update", handle_execute_update)
+    web_app.router.add_post("/api/verify_ticket", handle_verify_ticket)
+    web_app.router.add_get("/api/login_qrcode", handle_get_login_qrcode)
+    web_app.router.add_post("/api/login_qrcode_poll", handle_poll_qrcode_login)
 
     # 静态文件
     import os
