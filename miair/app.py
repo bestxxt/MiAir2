@@ -101,12 +101,14 @@ class MiAir:
         await web_site.start()
         log.info(f"Web 管理界面: http://{self.config.hostname}:{self.config.web_port}")
 
-        # 2. 如果已有账号和设备配置，启动 DLNA 和 AirPlay 服务
-        if (self.config.account or self.config.cookie) and self.config.mi_did:
+        # 2. 尝试登录并启动 DLNA 和 AirPlay 服务
+        # 即使没有账号，也要执行 login 初始化 auth.cloud_auth，否则无法扫码
+        await self.auth.login()
+        if self.auth.is_logged_in() and self.config.mi_did:
             await self._start_dlna_services()
         else:
-            if not self.config.account and not self.config.cookie:
-                log.info("未配置小米账号，请打开 Web 管理界面进行配置")
+            if not self.auth.is_logged_in():
+                log.info("未登录小米账号，请打开 Web 管理界面进行配置")
             elif not self.config.mi_did:
                 log.info("未选择音箱设备，请打开 Web 管理界面选择设备")
             log.info(f"请访问 http://{self.config.hostname}:{self.config.web_port} 进行配置")
@@ -116,9 +118,6 @@ class MiAir:
     async def _start_dlna_services(self):
         """启动 DLNA 相关服务 (登录、初始化音箱、SSDP、HTTP)"""
         try:
-            # 登录小米
-            await self.auth.login()
-
             # 检查登录状态
             if not self.auth.is_logged_in():
                 log.warning("登录失败，无法启动 DLNA 服务")
