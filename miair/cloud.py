@@ -195,7 +195,6 @@ class MiCloudAuth:
                 auth = await self._login_step1(sid=sid)
                 # 只有验证成功 (code == 0) 才提取 location，防止提取到 70016 错误的网页登录页
                 location = auth.get('location', '') if auth.get('code') == 0 else ''
-                log.info(f"verify_ticket path: after _login_step1, auth: {auth}, location: {location}")
             else:
                 log.warning(f"验证码成功提交，但未获取到 location。响应为: {resp}")
         else:
@@ -203,10 +202,8 @@ class MiCloudAuth:
                 auth.update(login_data)
             auth = await self._login_step1(sid=sid)
             location = auth.get('location', '') if auth.get('code') == 0 else ''
-            log.info(f"normal path: after _login_step1, auth: {auth}")
             
         if not location:
-            log.info("location is empty, calling _login_step2")
             auth['sid'] = sid
             location = await self._login_step2(**auth)
         elif sid != 'xiaomiio' and 'clientSign' not in location:
@@ -214,8 +211,6 @@ class MiCloudAuth:
             sign = f'nonce={auth.get("nonce")}&{auth.get("ssecurity")}'
             sign = base64.b64encode(hashlib.sha1(sign.encode()).digest()).decode()
             location += '&clientSign=' + parse.quote(sign)
-            
-        log.info(f"Proceeding to _login_step3 with location: {location}")
             
         response = await self._login_step3(location)
         http_code = response.get('status_code')
@@ -295,12 +290,10 @@ class MiCloudAuth:
             sign = base64.b64encode(hashlib.sha1(sign.encode()).digest()).decode()
             location += '&clientSign=' + parse.quote(sign)
             
-        log.info(f"Step 2 finished, generated location: {location}")
         return location
 
     async def _login_step3(self, location):
         headers = {'content-type': 'application/x-www-form-urlencoded'}
-        log.info(f"Executing Step 3 with location: {location}")
         resp_data = await self._account_get(location, headers=headers, return_response=True)
         
         cookies = resp_data.get('cookies', {})
