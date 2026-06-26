@@ -11,6 +11,7 @@ REQUIRED_PACKAGES = {
     "zeroconf": "zeroconf>=0.38.0",
     "Crypto": "pycryptodome>=3.15.0",
     "av": "av>=10.0.0",
+    "requests": "requests>=2.30.0",
 }
 
 
